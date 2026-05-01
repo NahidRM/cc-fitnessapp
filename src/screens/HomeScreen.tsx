@@ -11,7 +11,10 @@ import {
   SafeAreaView,
   ActivityIndicator,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
+
+const ACTIVE_SESSION_KEY = 'chalk_active_session';
 
 type Message = {
   id: string;
@@ -35,12 +38,22 @@ type Section = {
 };
 
 type ParsedWorkout = {
+  intent: 'log_coach' | 'log_performance';
   session_type: string;
   title: string | null;
   sections: Section[];
   wod_results: { wod_name: string | null; score_type: string | null; score_value: string | null }[];
   notes: string | null;
 };
+
+type ActiveSession = {
+  id: string;
+  date: string; // YYYY-MM-DD
+};
+
+function today(): string {
+  return new Date().toISOString().split('T')[0];
+}
 
 function formatExercise(ex: Exercise): string {
   let line = `• ${ex.name}`;
@@ -91,38 +104,71 @@ export default function HomeScreen() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [parsing, setParsing] = useState(false);
+  const [activeSession, setActiveSession] = useState<ActiveSession | null>(null);
   const listRef = useRef<FlatList>(null);
 
   useEffect(() => {
     listRef.current?.scrollToEnd({ animated: true });
   }, [messages, parsing]);
 
+  // On mount: load active session and check if it's stale
+  useEffect(() => {
+    async function checkActiveSession() {
+      const stored = await AsyncStorage.getItem(ACTIVE_SESSION_KEY);
+      if (!stored) return;
+
+      const session: ActiveSession = JSON.parse(stored);
+      setActiveSession(session);
+
+      if (session.date < today()) {
+        addChalkMessage(
+          `Looks like you didn't log your performance from ${session.date}. Send me your numbers when you're ready, or say "skip" to move on.`
+        );
+      }
+    }
+    checkActiveSession();
+  }, []);
+
+  function addChalkMessage(text: string) {
+    setMessages(prev => [...prev, {
+      id: Date.now().toString(),
+      text,
+      sender: 'chalk',
+    }]);
+  }
+
+  async function persistActiveSession(session: ActiveSession | null) {
+    setActiveSession(session);
+    if (session) {
+      await AsyncStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify(session));
+    } else {
+      await AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
+    }
+  }
+
   async function handleSignOut() {
     await supabase.auth.signOut();
   }
 
-  async function saveWorkout(parsed: ParsedWorkout, rawText: string) {
+  async function saveCoachWorkout(parsed: ParsedWorkout, rawText: string): Promise<string | null> {
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
+    if (!user) return null;
 
-    // Ensure user row exists
     await supabase.from('users').upsert({ id: user.id }, { onConflict: 'id' });
 
-    // Create session
-    const { data: session, error: sessionError } = await supabase
+    const { data: session, error } = await supabase
       .from('sessions')
       .insert({
         user_id: user.id,
-        date: new Date().toISOString().split('T')[0],
+        date: today(),
         type: parsed.session_type,
-        raw_user_text: rawText,
+        raw_coach_text: rawText,
       })
       .select()
       .single();
 
-    if (sessionError || !session) return;
+    if (error || !session) return null;
 
-    // Save all exercises from all sections, excluding warm-up sections
     const isWarmUp = (s: Section) => s.title?.toLowerCase().includes('warm up') ?? false;
     const exercises = (parsed.sections ?? []).filter(s => !isWarmUp(s)).flatMap(s => s.exercises).map(ex => ({
       session_id: session.id,
@@ -138,7 +184,84 @@ export default function HomeScreen() {
       await supabase.from('exercises').insert(exercises);
     }
 
-    // Save WOD results
+    const wods = (parsed.wod_results ?? []).map(w => ({
+      session_id: session.id,
+      wod_name: w.wod_name,
+      score_type: w.score_type,
+      score_value: w.score_value,
+    }));
+
+    if (wods.length > 0) {
+      await supabase.from('wod_results').insert(wods);
+    }
+
+    return session.id;
+  }
+
+  async function attachPerformance(sessionId: string, parsed: ParsedWorkout, rawText: string) {
+    await supabase.from('sessions').update({ raw_user_text: rawText }).eq('id', sessionId);
+
+    const isWarmUp = (s: Section) => s.title?.toLowerCase().includes('warm up') ?? false;
+    const exercises = (parsed.sections ?? []).filter(s => !isWarmUp(s)).flatMap(s => s.exercises).map(ex => ({
+      session_id: sessionId,
+      name: ex.name,
+      sets: ex.sets,
+      reps: ex.reps,
+      weight_kg: ex.weight_kg,
+      effort_pct: ex.effort_pct,
+      notes: ex.notes,
+    }));
+
+    if (exercises.length > 0) {
+      await supabase.from('exercises').insert(exercises);
+    }
+
+    const wods = (parsed.wod_results ?? []).map(w => ({
+      session_id: sessionId,
+      wod_name: w.wod_name,
+      score_type: w.score_type,
+      score_value: w.score_value,
+    }));
+
+    if (wods.length > 0) {
+      await supabase.from('wod_results').insert(wods);
+    }
+  }
+
+  async function saveStandalonePerformance(parsed: ParsedWorkout, rawText: string) {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+
+    await supabase.from('users').upsert({ id: user.id }, { onConflict: 'id' });
+
+    const { data: session, error } = await supabase
+      .from('sessions')
+      .insert({
+        user_id: user.id,
+        date: today(),
+        type: parsed.session_type,
+        raw_user_text: rawText,
+      })
+      .select()
+      .single();
+
+    if (error || !session) return;
+
+    const isWarmUp = (s: Section) => s.title?.toLowerCase().includes('warm up') ?? false;
+    const exercises = (parsed.sections ?? []).filter(s => !isWarmUp(s)).flatMap(s => s.exercises).map(ex => ({
+      session_id: session.id,
+      name: ex.name,
+      sets: ex.sets,
+      reps: ex.reps,
+      weight_kg: ex.weight_kg,
+      effort_pct: ex.effort_pct,
+      notes: ex.notes,
+    }));
+
+    if (exercises.length > 0) {
+      await supabase.from('exercises').insert(exercises);
+    }
+
     const wods = (parsed.wod_results ?? []).map(w => ({
       session_id: session.id,
       wod_name: w.wod_name,
@@ -154,47 +277,72 @@ export default function HomeScreen() {
   async function handleSend() {
     if (!input.trim() || parsing) return;
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      text: input.trim(),
-      sender: 'user',
-    };
-    setMessages(prev => [...prev, userMessage]);
+    const text = input.trim();
     setInput('');
+
+    const userMessage: Message = { id: Date.now().toString(), text, sender: 'user' };
+    setMessages(prev => [...prev, userMessage]);
+
+    // Handle "skip" — clear the stale session without logging
+    if (text.toLowerCase() === 'skip') {
+      await persistActiveSession(null);
+      addChalkMessage("No problem, moving on.");
+      return;
+    }
+
     setParsing(true);
 
     try {
       const { data, error } = await supabase.functions.invoke('parse-workout', {
-        body: { text: userMessage.text },
+        body: { text },
       });
 
       setParsing(false);
 
-      let replyText: string;
       if (error || !data || data.error) {
-        replyText = 'Something went wrong. Try again.';
-      } else if (data.intent === 'recall' || data.intent === 'convert') {
-        replyText = data.answer;
-      } else {
-        // intent === 'log'
-        saveWorkout(data, userMessage.text);
-        replyText = formatParsedWorkout(data);
+        addChalkMessage('Something went wrong. Try again.');
+        return;
       }
 
-      const replyMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        text: replyText,
-        sender: 'chalk',
-      };
-      setMessages(prev => [...prev, replyMessage]);
-    } catch (err) {
+      if (data.intent === 'recall' || data.intent === 'convert') {
+        addChalkMessage(data.answer);
+        return;
+      }
+
+      if (data.intent === 'log_coach') {
+        const sessionId = await saveCoachWorkout(data, text);
+        if (sessionId) {
+          await persistActiveSession({ id: sessionId, date: today() });
+          addChalkMessage(`Got it. Send me your numbers when you're done.`);
+        } else {
+          addChalkMessage('Could not save that. Try again.');
+        }
+        return;
+      }
+
+      if (data.intent === 'log_performance') {
+        if (activeSession) {
+          // Attach to the existing session (coach workout or same-day session)
+          await attachPerformance(activeSession.id, data, text);
+          await persistActiveSession(null);
+          addChalkMessage(`Logged. Nice work.\n\n${formatParsedWorkout(data)}`);
+        } else {
+          // No coach plan on record — save as a standalone session
+          await saveStandalonePerformance(data, text);
+          addChalkMessage(formatParsedWorkout(data));
+        }
+        return;
+      }
+
+      addChalkMessage('Something went wrong. Try again.');
+    } catch {
       setParsing(false);
+      addChalkMessage('Something went wrong. Try again.');
     }
   }
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* Header */}
       <View style={styles.header}>
         <Text style={styles.logo}>chalk</Text>
         <TouchableOpacity onPress={handleSignOut}>
@@ -202,7 +350,6 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Messages */}
       <FlatList
         ref={listRef}
         data={messages}
@@ -233,7 +380,6 @@ export default function HomeScreen() {
         }
       />
 
-      {/* Input bar */}
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <View style={styles.inputRow}>
           <TextInput

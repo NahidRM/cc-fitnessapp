@@ -27,14 +27,15 @@ async function callClaude(prompt: string): Promise<string> {
 function classifyPrompt(text: string): string {
   return `Classify this message and return ONLY valid JSON. No explanation.
 
-The message is one of three intents:
-- "log": user is logging a workout or pasting a coach workout plan
+The message is one of four intents:
+- "log_coach": a structured workout plan from a coach (has labeled sections like A/B/C, uses percentages or prescribed weights, imperative/future tone, often includes warm-up)
+- "log_performance": the user's actual post-workout update (casual, past tense, personal — like what they'd text their coach after training)
 - "recall": user is asking about their past workout history (e.g. "what did I squat last time?", "what weight did I use for 5 reps on bench?")
 - "convert": user is asking to convert a unit (e.g. "convert 100kg to lbs", "how much is 225 lbs in kg?")
 
-For "log", return this shape:
+For "log_coach" and "log_performance", return this shape (only the intent value differs):
 {
-  "intent": "log",
+  "intent": "log_coach" | "log_performance",
   "session_type": "strength" | "wod" | "mixed" | "other",
   "title": string | null,
   "sections": [
@@ -65,7 +66,7 @@ For "convert", return:
   "answer": string
 }
 
-Rules for "log":
+Rules for log intents:
 - Convert all weights to kg (1 lb = 0.4536 kg), round to 2 decimal places.
 - "effort_pct" is a number (e.g. 80 for 80%), only when explicitly mentioned. Otherwise null.
 - "notes" on an exercise is for qualifiers like "each leg", "tempo", "pause", etc. Do not put effort % in notes.
@@ -103,8 +104,8 @@ Deno.serve(async (req) => {
       });
     }
 
-    // Workout log — return parsed data for the frontend to save and display
-    if (result.intent === 'log') {
+    // Workout log (coach plan or user performance) — return parsed data for the frontend
+    if (result.intent === 'log_coach' || result.intent === 'log_performance') {
       return new Response(JSON.stringify(result), {
         headers: { ...corsHeaders, 'content-type': 'application/json' },
       });
