@@ -24,6 +24,7 @@ type Exercise = {
   sets: number | null;
   reps: number | null;
   weight_kg: number | null;
+  effort_pct: number | null;
   notes: string | null;
 };
 
@@ -45,7 +46,8 @@ function formatExercise(ex: Exercise): string {
   let line = `• ${ex.name}`;
   if (ex.sets && ex.reps) line += ` — ${ex.sets}×${ex.reps}`;
   if (ex.weight_kg) line += ` @ ${ex.weight_kg}kg`;
-  if (ex.notes) line += ` (${ex.notes})`;
+  if (ex.effort_pct) line += ` (${ex.effort_pct}% effort)`;
+  if (ex.notes) line += ` [${ex.notes}]`;
   return line;
 }
 
@@ -128,6 +130,7 @@ export default function HomeScreen() {
       sets: ex.sets,
       reps: ex.reps,
       weight_kg: ex.weight_kg,
+      effort_pct: ex.effort_pct,
       notes: ex.notes,
     }));
 
@@ -167,13 +170,20 @@ export default function HomeScreen() {
 
       setParsing(false);
 
-      if (!error && data && !data.parseError) {
+      let replyText: string;
+      if (error || !data || data.error) {
+        replyText = 'Something went wrong. Try again.';
+      } else if (data.intent === 'recall' || data.intent === 'convert') {
+        replyText = data.answer;
+      } else {
+        // intent === 'log'
         saveWorkout(data, userMessage.text);
+        replyText = formatParsedWorkout(data);
       }
 
       const replyMessage: Message = {
         id: (Date.now() + 1).toString(),
-        text: error ? 'Could not parse that. Try again.' : formatParsedWorkout(data),
+        text: replyText,
         sender: 'chalk',
       };
       setMessages(prev => [...prev, replyMessage]);
